@@ -74,6 +74,36 @@ function formatDuration(ms) {
   if (m && d === 0) parts.push(m + "m");
   return parts.join(" ") || "<1m";
 }
+// Returns a tier label for in-progress equipment based on how long it has been running.
+// Thresholds (hours) are configurable but use sensible defaults.
+const PROGRESS_TIERS = { warn: 4, overdue: 8 };
+// Effective supervisor for a piece of equipment: explicit lead (if set), else the assigned group's supervisor.
+function effectiveSupervisor(eq, employees, groups) {
+  if (eq.lead) {
+    const e = employees.find(x => x.id === eq.lead);
+    if (e) return e;
+  }
+  if (eq.assigneeType === "group") {
+    const g = groups.find(x => x.id === eq.assigneeId);
+    if (g) {
+      const members = employees.filter(e => g.members.includes(e.id));
+      return members.find(e => /supervis|lead|foreman/i.test(e.title || "")) || members[0] || null;
+    }
+  }
+  if (eq.assigneeType === "employee") {
+    return employees.find(x => x.id === eq.assigneeId) || null;
+  }
+  return null;
+}
+
+function inProgressTier(eq, now) {
+  if (eq.status !== "in_progress" || !eq.startedAt) return "";
+  const hours = (now - new Date(eq.startedAt).getTime()) / 3600000;
+  if (hours >= PROGRESS_TIERS.overdue) return "overdue";
+  if (hours >= PROGRESS_TIERS.warn) return "warn";
+  return "fresh";
+}
+
 function useTick(activeIntervalMs = 60000) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -339,6 +369,8 @@ function Board({ equipment, setEquipment, employees, groups, sites = [], current
     }));
   const assign = (id, type, aid) =>
     setEquipment(prev => prev.map(e => e.id === id ? { ...e, assigneeType: type, assigneeId: aid } : e));
+  const setLead = (id, leadId) =>
+    setEquipment(prev => prev.map(e => e.id === id ? { ...e, lead: leadId || null } : e));
   const remove = (id) => setEquipment(prev => prev.filter(e => e.id !== id));
 
   return (
@@ -378,7 +410,7 @@ function Board({ equipment, setEquipment, employees, groups, sites = [], current
 
       {view === "table" ? (
         <EquipTable items={filtered} employees={employees} groups={groups}
-          onAssign={assign} onStatus={setStatus} onRemove={remove} />
+          onAssign={assign} onLead={setLead} onStatus={setStatus} onRemove={remove} />
       ) : view === "status" ? (
         <div className="cols">
           {cols.map(({ s, items }) => {
@@ -467,14 +499,18 @@ function EquipCard({ eq, color, employees, groups, onAssign, onStatus, onRemove 
   );
 }
 
-function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) {
+function EquipTable({ items, employees, groups, onAssign, onLead, onStatus, onRemove }) {
   const now = useTick();
   const [sort, setSort] = useState({ key: "name", dir: "asc" });
-  const [filters, setFilters] = useState({ name: "", site: "", unit: "", system: "", area: "", assignee: "", status: "" });
+  const [filters, setFilters] = useState({ name: "", site: "", unit: "", system: "", area: "", assignee: "", lead: "", status: "" });
 
   const assigneeKey = (eq) => {
     const a = assigneeLabel(eq, employees, groups);
     return a ? a.name : "";
+  };
+  const leadName = (eq) => {
+    const sup = effectiveSupervisor(eq, employees, groups);
+    return sup ? sup.name : "";
   };
 
   const filtered = useMemo(() => items.filter(e => {
@@ -488,8 +524,12 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
       if (filters.assignee === "__unassigned") { if (e.assigneeType) return false; }
       else if (`${e.assigneeType}:${e.assigneeId}` !== filters.assignee) return false;
     }
+    if (filters.lead) {
+      if (filters.lead === "__none") { if (effectiveSupervisor(e, employees, groups)) return false; }
+      else if ((e.lead || "") !== filters.lead) return false;
+    }
     return true;
-  }), [items, filters]);
+  }), [items, filters, employees, groups]);
 
   const sorted = useMemo(() => {
     const arr = filtered.slice();
@@ -502,6 +542,7 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
         case "system": av = a.system || ""; bv = b.system || ""; break;
         case "area": av = a.area || ""; bv = b.area || ""; break;
         case "assignee": av = assigneeKey(a); bv = assigneeKey(b); break;
+        case "lead": av = leadName(a); bv = leadName(b); break;
         case "status": av = STATUS_ORDER.indexOf(a.status); bv = STATUS_ORDER.indexOf(b.status); break;
         case "duration": av = durationMs(a, now) ?? -1; bv = durationMs(b, now) ?? -1; break;
         case "done": av = a.completedDate || ""; bv = b.completedDate || ""; break;
@@ -518,7 +559,7 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
   const sortIcon = (key) => sort.key === key ? (sort.dir === "asc" ? " ▲" : " ▼") : "";
   const updateFilter = (k, v) => setFilters(f => ({ ...f, [k]: v }));
   const anyFilter = Object.values(filters).some(Boolean);
-  const clearFilters = () => setFilters({ name: "", site: "", unit: "", system: "", area: "", assignee: "", status: "" });
+  const clearFilters = () => setFilters({ name: "", site: "", unit: "", system: "", area: "", assignee: "", lead: "", status: "" });
 
   if (items.length === 0) return <div className="empty">No equipment</div>;
   const counts = STATUS_ORDER.map(s => ({ s, n: items.filter(i => i.status === s).length }));
@@ -542,6 +583,7 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
             <th onClick={() => toggleSort("system")}>System{sortIcon("system")}</th>
             <th onClick={() => toggleSort("area")}>Area{sortIcon("area")}</th>
             <th onClick={() => toggleSort("assignee")}>Assignee{sortIcon("assignee")}</th>
+            <th onClick={() => toggleSort("lead")}>Lead{sortIcon("lead")}</th>
             <th onClick={() => toggleSort("status")}>Status{sortIcon("status")}</th>
             <th onClick={() => toggleSort("duration")}>Duration{sortIcon("duration")}</th>
             <th onClick={() => toggleSort("done")}>Done{sortIcon("done")}</th>
@@ -566,6 +608,13 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
               </select>
             </th>
             <th>
+              <select className="flt" value={filters.lead} onChange={e => updateFilter("lead", e.target.value)}>
+                <option value="">All</option>
+                <option value="__none">— None —</option>
+                {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+              </select>
+            </th>
+            <th>
               <select className="flt" value={filters.status} onChange={e => updateFilter("status", e.target.value)}>
                 <option value="">All</option>
                 {STATUS_ORDER.map(k => <option key={k} value={k}>{STATUS[k].label}</option>)}
@@ -577,7 +626,7 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
           </tr>
         </thead>
         <tbody>
-          {sorted.length === 0 && <tr><td colSpan={10} className="td-empty">No equipment matches filters</td></tr>}
+          {sorted.length === 0 && <tr><td colSpan={11} className="td-empty">No equipment matches filters</td></tr>}
           {sorted.map(eq => {
             const a = assigneeLabel(eq, employees, groups);
             const St = STATUS[eq.status];
@@ -604,6 +653,13 @@ function EquipTable({ items, employees, groups, onAssign, onStatus, onRemove }) 
                     {groups.length > 0 && <optgroup label="Groups">
                       {groups.map(g => <option key={g.id} value={`group:${g.id}`}>{g.name}</option>)}
                     </optgroup>}
+                  </select>
+                </td>
+                <td>
+                  <select className="row-sel" value={eq.lead || ""} onChange={e => onLead(eq.id, e.target.value)}
+                    title={eq.lead ? "Explicit lead set" : "Defaults to assignee's supervisor"}>
+                    <option value="">{leadName(eq) ? `(${leadName(eq)})` : "— Auto —"}</option>
+                    {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                   </select>
                 </td>
                 <td>
@@ -702,6 +758,7 @@ function Dashboard({ equipment, employees, groups, currentSite = "" }) {
   const [to, setTo] = useState("");
   const [who, setWho] = useState("all");
   const [focus, setFocus] = useState("in_progress"); // "all" | "not_started" | "in_progress" | "completed"
+  const [groupBy, setGroupBy] = useState("crew"); // "crew" | "supervisor" | "org"
 
   const scoped = useMemo(() =>
     currentSite ? equipment.filter(e => (e.site || "") === currentSite) : equipment,
@@ -732,19 +789,186 @@ function Dashboard({ equipment, employees, groups, currentSite = "" }) {
     : focus === "completed" ? "Completed Work"
     : STATUS[focus].label;
 
+  const eqTile = (eq, crewSupId) => {
+    const tier = inProgressTier(eq, now);
+    const dur = formatDuration(durationMs(eq, now));
+    const sup = effectiveSupervisor(eq, employees, groups);
+    const leadHint = eq.lead && sup && sup.id !== crewSupId ? sup.name : null;
+    return (
+      <div className={"tile eq " + eq.status + (tier ? " " + tier : "")} key={eq.id}
+        title={`${eq.name} · ${STATUS[eq.status].label}${dur ? " · " + dur : ""}${leadHint ? " · Lead: " + leadHint : ""}`}>
+        <div className="eq-name-line">{eq.name}</div>
+        {leadHint && <div className="eq-lead-line">→ {leadHint}</div>}
+      </div>
+    );
+  };
+
+  // ---- Crew boards: by crew (group) ----
+  const visibleGroups = currentSite ? groups.filter(g => (g.site || "") === currentSite) : groups;
+  const crews = visibleGroups.map(g => {
+    const members = employees.filter(e => g.members.includes(e.id));
+    const supervisor = members.find(e => /supervis|lead|foreman/i.test(e.title || ""))
+      || members[0]
+      || null;
+    const equip = scoped.filter(e => e.assigneeType === "group" && e.assigneeId === g.id && e.status !== "completed");
+    return { group: g, supervisor, equipment: equip };
+  });
+  const directs = useMemo(() => {
+    const map = new Map();
+    scoped.forEach(e => {
+      if (e.assigneeType !== "employee" || e.status === "completed") return;
+      const emp = employees.find(x => x.id === e.assigneeId);
+      if (!emp) return;
+      if (!map.has(emp.id)) map.set(emp.id, { employee: emp, equipment: [] });
+      map.get(emp.id).equipment.push(e);
+    });
+    return [...map.values()];
+  }, [scoped, employees]);
+
+  // ---- Crew boards: by supervisor ----
+  // Group equipment under each effective supervisor; each group within shows that group's tile.
+  const bySupervisor = useMemo(() => {
+    const map = new Map(); // supId -> { supervisor, groups: Map(groupId -> {group, equipment}), solos: [] }
+    const ensure = (sup) => {
+      const key = sup ? sup.id : "__none";
+      if (!map.has(key)) map.set(key, { supervisor: sup, lanes: new Map(), solos: [] });
+      return map.get(key);
+    };
+    scoped.forEach(e => {
+      if (e.status === "completed") return;
+      const sup = effectiveSupervisor(e, employees, groups);
+      const bucket = ensure(sup);
+      if (e.assigneeType === "group") {
+        const g = groups.find(x => x.id === e.assigneeId);
+        if (!g) return;
+        if (!bucket.lanes.has(g.id)) bucket.lanes.set(g.id, { group: g, equipment: [] });
+        bucket.lanes.get(g.id).equipment.push(e);
+      } else if (e.assigneeType === "employee") {
+        bucket.solos.push(e);
+      }
+    });
+    return [...map.values()].map(b => ({ ...b, lanes: [...b.lanes.values()] }));
+  }, [scoped, employees, groups]);
+
+  // ---- Org chart: Supervisor at top, leads as sub-trees below.
+  // For each crew supervisor, group their in-progress equipment by lead.
+  // Equipment whose lead is the supervisor (or has no explicit lead) goes into the supervisor's own bucket.
+  const orgChart = useMemo(() => {
+    const crewSup = (eq) => {
+      if (eq.assigneeType === "group") {
+        const g = groups.find(x => x.id === eq.assigneeId);
+        if (!g) return null;
+        const members = employees.filter(e => g.members.includes(e.id));
+        return members.find(e => /supervis|lead|foreman/i.test(e.title || "")) || members[0] || null;
+      }
+      if (eq.assigneeType === "employee") return employees.find(x => x.id === eq.assigneeId) || null;
+      return null;
+    };
+    const map = new Map();
+    scoped.forEach(e => {
+      if (e.status !== "in_progress") return;
+      const sup = crewSup(e);
+      if (!sup) return;
+      if (!map.has(sup.id)) map.set(sup.id, { supervisor: sup, leadMap: new Map() });
+      const bucket = map.get(sup.id);
+      const leadKey = e.lead && e.lead !== sup.id ? e.lead : "__sup";
+      const leadObj = leadKey === "__sup" ? null : (employees.find(x => x.id === leadKey) || null);
+      if (!bucket.leadMap.has(leadKey)) bucket.leadMap.set(leadKey, { lead: leadObj, equipment: [] });
+      bucket.leadMap.get(leadKey).equipment.push(e);
+    });
+    return [...map.values()].map(b => {
+      // Supervisor's own bucket first (when present), then explicit leads sorted by name.
+      const leads = [...b.leadMap.values()];
+      leads.sort((a, c) => (a.lead ? 1 : 0) - (c.lead ? 1 : 0) || (a.lead && c.lead ? a.lead.name.localeCompare(c.lead.name) : 0));
+      return { supervisor: b.supervisor, leads };
+    });
+  }, [scoped, employees, groups]);
+
+  // Hide cards with no supervisor in By Supervisor view too.
+  const bySupervisorVisible = bySupervisor.filter(b => b.supervisor);
+
   return (
     <section className="wrap">
-      <div className="bar"><h2>Dashboard</h2></div>
-      <div className="stats">
-        <button className={"stat big" + (focus === "all" ? " active" : "")} onClick={() => setFocus("all")}>
-          <span>Total</span><b>{total}</b>
-          <em className="stat-hint">Click to view all</em>
+      <div className="bar">
+        <h2>Dashboard</h2>
+        <div className="toggle">
+          <button className={groupBy === "crew" ? "on" : ""} onClick={() => setGroupBy("crew")}>By Crew</button>
+          <button className={groupBy === "supervisor" ? "on" : ""} onClick={() => setGroupBy("supervisor")}>By Supervisor</button>
+          <button className={groupBy === "org" ? "on" : ""} onClick={() => setGroupBy("org")}>Org Chart</button>
+        </div>
+      </div>
+
+      {groupBy === "crew" ? (
+        <div className="crew-grid">
+          {crews.length === 0 && directs.length === 0 && (
+            <div className="empty">No crews yet. Create a group, assign equipment to it, and it'll appear here.</div>
+          )}
+          {crews.map(c => (
+            <div className="crew" key={c.group.id}>
+              <div className="tile sup">{c.supervisor ? c.supervisor.name : "— No supervisor —"}</div>
+              <div className="tile grp">{c.group.name}</div>
+              {c.equipment.length === 0 && <div className="tile empty-tile">No equipment</div>}
+              {c.equipment.map(eq => eqTile(eq, c.supervisor && c.supervisor.id))}
+            </div>
+          ))}
+          {directs.map(d => (
+            <div className="crew" key={"emp:" + d.employee.id}>
+              <div className="tile sup">{d.employee.name}</div>
+              {d.equipment.map(eq => eqTile(eq, d.employee.id))}
+            </div>
+          ))}
+        </div>
+      ) : groupBy === "supervisor" ? (
+        <div className="crew-grid">
+          {bySupervisorVisible.length === 0 && (
+            <div className="empty">No active work assigned. Set leads on the Job Board or assign equipment.</div>
+          )}
+          {bySupervisorVisible.map(b => (
+            <div className="crew" key={b.supervisor.id}>
+              <div className="tile sup">{b.supervisor.name}</div>
+              {b.lanes.map(l => (
+                <React.Fragment key={l.group.id}>
+                  <div className="tile grp">{l.group.name}</div>
+                  {l.equipment.map(eq => eqTile(eq, b.supervisor.id))}
+                </React.Fragment>
+              ))}
+              {b.solos.length > 0 && b.solos.map(eq => eqTile(eq, b.supervisor.id))}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="crew-grid">
+          {orgChart.length === 0 && (
+            <div className="empty">No in-progress work assigned.</div>
+          )}
+          {orgChart.map(b => (
+            <div className="crew" key={b.supervisor.id}>
+              <div className="tile sup">{b.supervisor.name}</div>
+              {b.leads.map((l, i) => (
+                <div className={"lead-branch" + (i > 0 ? " divided" : "")} key={l.lead ? l.lead.id : "sup"}>
+                  {l.lead ? (
+                    <div className="tile lead-tile lead-header">↳ {l.lead.name}</div>
+                  ) : (
+                    <div className="lead-self-mark">Direct</div>
+                  )}
+                  <div className="lead-eq">
+                    {l.equipment.map(eq => eqTile(eq, l.lead ? l.lead.id : b.supervisor.id))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="status-tiles">
+        <button className={"status-tile total" + (focus === "all" ? " on" : "")} onClick={() => setFocus("all")}>
+          <span>Total</span><b>{total}</b><em>Click to view</em>
         </button>
         {counts.map(({ s, n }) => {
           const St = STATUS[s];
-          return <button className={"stat" + (focus === s ? " active" : "")} key={s} style={{ "--c": St.color }} onClick={() => setFocus(s)}>
-            <span><St.icon size={14} /> {St.label}</span><b>{n}</b>
-            <em className="stat-hint">Click to view</em>
+          return <button key={s} className={"status-tile " + s + (focus === s ? " on" : "")} onClick={() => setFocus(s)}>
+            <span><St.icon size={14} /> {St.label}</span><b>{n}</b><em>Click to view</em>
           </button>;
         })}
       </div>
@@ -1550,6 +1774,62 @@ main{padding:28px;max-width:1400px;margin:0 auto;}
 .stat-hint{font-size:10px;color:var(--mut);font-style:normal;text-transform:uppercase;letter-spacing:.5px;opacity:0;transition:.15s;margin-top:-2px;}
 .stat:hover .stat-hint, .stat.active .stat-hint{opacity:1;}
 .row-count{color:var(--mut);font-weight:400;font-size:13px;margin-left:6px;}
+.crew-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:18px;margin-bottom:26px;}
+.crew{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:6px;}
+.tile{padding:9px 11px;border-radius:7px;font-weight:700;font-size:12.5px;letter-spacing:.3px;text-align:center;color:#16191f;text-transform:uppercase;box-shadow:inset 0 -2px 0 rgba(0,0,0,.12);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tile.sup{background:#f3cf42;}
+.tile.sup.solo{background:#d9b239;}
+.tile.grp{background:#f08a3a;color:#fff;}
+.tile.grp.solo{background:#b76a2a;}
+.tile.eq{background:#7fb6d4;color:#0f1115;}
+.tile.eq.not_started{background:#9aa3b4;color:#0f1115;}
+.tile.eq.in_progress{background:#6fa8ff;color:#0f1115;}
+.tile.eq.completed{background:#a8d499;color:#0f1115;}
+.tile.eq.in_progress.fresh{background:#6fa8ff;color:#0f1115;}
+.tile.eq.in_progress.warn{background:#f3cf42;color:#0f1115;}
+.tile.eq.in_progress.overdue{background:#e2553f;color:#fff;animation:pulseOverdue 2s ease-in-out infinite;}
+@keyframes pulseOverdue{0%,100%{box-shadow:inset 0 -2px 0 rgba(0,0,0,.18);}50%{box-shadow:inset 0 -2px 0 rgba(0,0,0,.18),0 0 14px rgba(226,85,63,.55);}}
+.tile.empty-tile{background:transparent;color:var(--mut);border:1px dashed var(--line);text-transform:none;font-weight:500;}
+.tile.eq{display:flex;flex-direction:column;gap:2px;}
+.eq-name-line{font-weight:700;}
+.eq-lead-line{font-size:9.5px;font-weight:600;opacity:.78;text-transform:none;letter-spacing:.2px;}
+.org-grid{display:flex;flex-direction:column;gap:24px;margin-bottom:26px;}
+.org-tree{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px 18px;display:flex;flex-direction:column;align-items:center;overflow-x:auto;}
+.org-node{display:flex;flex-direction:column;align-items:center;gap:5px;}
+.org-sub{font-size:9.5px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-weight:700;white-space:nowrap;}
+.org-trunk{width:1.5px;height:18px;background:var(--line);}
+.org-trunk.small{height:14px;}
+.org-row{display:flex;gap:24px;align-items:flex-start;justify-content:center;position:relative;padding-top:14px;}
+.org-row::before{content:"";position:absolute;top:0;left:50%;height:1.5px;background:var(--line);width:calc(100% - 80px);transform:translateX(-50%);}
+.org-row.single::before{display:none;}
+.org-branch{display:flex;flex-direction:column;align-items:center;gap:0;position:relative;min-width:140px;}
+.org-branch::before{content:"";position:absolute;top:0;left:50%;width:1.5px;height:14px;background:var(--line);transform:translateX(-50%);}
+.org-row.single .org-branch::before{display:none;}
+.org-equipment{display:flex;flex-direction:column;gap:4px;width:100%;align-items:stretch;}
+.tile.lead-tile{background:#c08bd9;color:#1a0f1f;min-width:120px;}
+.lead-branch{display:flex;flex-direction:column;gap:5px;padding-left:14px;position:relative;margin-top:6px;}
+.lead-branch::before{content:"";position:absolute;left:4px;top:8px;bottom:8px;width:1.5px;background:var(--line);border-radius:1px;}
+.lead-branch.divided{border-top:1px dashed var(--line);padding-top:8px;}
+.lead-self-mark{font-size:9.5px;color:var(--mut);text-transform:uppercase;letter-spacing:1.2px;font-weight:700;padding:1px 0 1px 4px;}
+.lead-header{align-self:flex-start;font-size:11px !important;padding:4px 10px !important;}
+.lead-eq{display:flex;flex-direction:column;gap:5px;}
+.tile.lead-tile.self{background:#9bc4dd;color:#0f1115;opacity:.85;}
+.org-tree .tile{padding:6px 10px;font-size:11px;letter-spacing:.3px;}
+.org-tree .tile.sup{padding:8px 16px;font-size:13px;min-width:160px;}
+.org-tree .tile.lead-tile{padding:6px 12px;font-size:11px;}
+.org-tree .eq-name-line{font-size:11px;font-weight:700;}
+.org-tree .eq-lead-line{font-size:8.5px;}
+.status-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:26px;padding:18px;background:var(--panel);border:1px solid var(--line);border-radius:14px;}
+.status-tile{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:18px 14px;border-radius:11px;font-family:inherit;cursor:pointer;border:2px solid transparent;color:#0f1115;font-weight:700;transition:transform .15s,box-shadow .15s;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
+.status-tile:hover{transform:translateY(-2px);box-shadow:inset 0 -3px 0 rgba(0,0,0,.2),0 6px 18px rgba(0,0,0,.3);}
+.status-tile.on{border-color:#fff;}
+.status-tile.total{background:#f08a3a;color:#fff;}
+.status-tile.not_started{background:#9aa3b4;}
+.status-tile.in_progress{background:#6fa8ff;}
+.status-tile.completed{background:#a8d499;}
+.status-tile span{font-size:11.5px;text-transform:uppercase;letter-spacing:.7px;display:flex;align-items:center;gap:5px;font-weight:700;}
+.status-tile b{font-size:36px;font-weight:900;font-family:'Space Mono',monospace;line-height:1;}
+.status-tile em{font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-style:normal;opacity:.7;font-weight:600;}
 .stat span{font-size:12px;color:var(--mut);font-weight:600;display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.5px;}
 .stat b{font-size:34px;font-weight:900;font-family:'Space Mono',monospace;}
 .stat.big{--c:var(--acc);}
